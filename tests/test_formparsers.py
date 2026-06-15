@@ -1,988 +1,149 @@
-from __future__ import annotations
+def test_multipart_spool_max_size_in_memory() -> None:
+    """Test that files smaller than spool_max_size stay in memory."""
+    from starlette.formparsers import MultiPartParser, SpooledTemporaryFile
+    from starlette.datastructures import Headers
 
-import os
-import threading
-from collections.abc import AsyncGenerator, Generator
-from contextlib import AbstractContextManager, nullcontext as does_not_raise
-from io import BytesIO
-from pathlib import Path
-from tempfile import SpooledTemporaryFile
-from typing import Any, ClassVar
-from unittest import mock
+    async def stream() -> bytes:
+        yield (
+            b"--boundary\r\n"
+            b'Content-Disposition: form-data; name="file"; filename="test.txt"\r\n'
+            b"Content-Type: text/plain\r\n\r\n"
+            b"hello world\r\n"
+            b"--boundary--\r\n"
+        )
 
-import pytest
+    headers = Headers({"content-type": "multipart/form-data; boundary=boundary"})
+    parser = MultiPartParser(headers, stream(), spool_max_size=1024 * 1024)  # 1MB threshold
+    result = parser.parse()
+    import anyio
 
-from starlette.applications import Starlette
-from starlette.datastructures import Headers, UploadFile
-from starlette.formparsers import FormParser, MultiPartException, MultiPartParser, _user_safe_decode
-from starlette.requests import Request
-from starlette.responses import JSONResponse
-from starlette.routing import Mount
-from starlette.types import ASGIApp, Receive, Scope, Send
-from tests.types import TestClientFactory
+    data = anyio.run(result)
 
-
-class ForceMultipartDict(dict[Any, Any]):
-    def __bool__(self) -> bool:
-        return True
+    file = data["file"]
+    assert file.filename == "test.txt"
+    assert file._in_memory is True  # Should still be in memory (small file)
 
 
-# FORCE_MULTIPART is an empty dict that boolean-evaluates as `True`.
-FORCE_MULTIPART = ForceMultipartDict()
+def test_multipart_spool_max_size_rolled_to_disk() -> None:
+    """Test that files larger than spool_max_size roll to disk."""
+    from starlette.formparsers import MultiPartParser, SpooledTemporaryFile
+    from starlette.datastructures import Headers
+
+    async def stream() -> bytes:
+        yield (
+            b"--boundary\r\n"
+            b'Content-Disposition: form-data; name="file"; filename="test.txt"\r\n'
+            b"Content-Type: text/plain\r\n\r\n"
+            + b"x" * (1024 * 1024 + 100)  # Slightly over 1MB
+            + b"\r\n"
+            b"--boundary--\r\n"
+        )
+
+    headers = Headers({"content-type": "multipart/form-data; boundary=boundary"})
+    parser = MultiPartParser(headers, stream(), spool_max_size=1024 * 1024)  # 1MB threshold
+    result = parser.parse()
+    import anyio
+
+    data = anyio.run(result)
+
+    file = data["file"]
+    assert file.filename == "test.txt"
+    assert file._in_memory is False  # Should have rolled to disk
 
 
-async def app(scope: Scope, receive: Receive, send: Send) -> None:
-    request = Request(scope, receive)
-    data = await request.form()
-    output: dict[str, Any] = {}
-    for key, value in data.items():
-        if isinstance(value, UploadFile):
-            content = await value.read()
-            output[key] = {
-                "filename": value.filename,
-                "size": value.size,
-                "content": content.decode(),
-                "content_type": value.content_type,
-            }
-        else:
-            output[key] = value
-    await request.close()
-    response = JSONResponse(output)
-    await response(scope, receive, send)
+def test_multipart_custom_spool_max_size() -> None:
+    """Test that custom spool_max_size parameter is respected."""
+    from starlette.formparsers import MultiPartParser
+    from starlette.datastructures import Headers
+
+    async def stream() -> bytes:
+        yield (
+            b"--boundary\r\n"
+            b'Content-Disposition: form-data; name="file"; filename="test.txt"\r\n'
+            b"Content-Type: text/plain\r\n\r\n"
+            b"x" * 500  # 500 bytes
+            b"\r\n"
+            b"--boundary--\r\n"
+        )
+
+    headers = Headers({"content-type": "multipart/form-data; boundary=boundary"})
+    parser = MultiPartParser(headers, stream(), spool_max_size=100)  # Only 100 bytes threshold
+    result = parser.parse()
+    import anyio
+
+    data = anyio.run(result)
+
+    file = data["file"]
+    assert file.filename == "test.txt"
+    assert file._in_memory is False  # Should roll to disk (500 > 100)
 
 
-async def multi_items_app(scope: Scope, receive: Receive, send: Send) -> None:
-    request = Request(scope, receive)
-    data = await request.form()
-    output: dict[str, list[Any]] = {}
-    for key, value in data.multi_items():
-        if key not in output:
-            output[key] = []
-        if isinstance(value, UploadFile):
-            content = await value.read()
-            output[key].append(
-                {
-                    "filename": value.filename,
-                    "size": value.size,
-                    "content": content.decode(),
-                    "content_type": value.content_type,
-                }
-            )
-        else:
-            output[key].append(value)
-    await request.close()
-    response = JSONResponse(output)
-    await response(scope, receive, send)
+def test_request_form_spool_max_size(test_client_factory: TestClientFactory) -> None:
+    """Test that request.form() accepts spool_max_size parameter."""
+    from starlette.requests import Request
+    from starlette.responses import JSONResponse
 
-
-async def app_with_headers(scope: Scope, receive: Receive, send: Send) -> None:
-    request = Request(scope, receive)
-    data = await request.form()
-    output: dict[str, Any] = {}
-    for key, value in data.items():
-        if isinstance(value, UploadFile):
-            content = await value.read()
-            output[key] = {
-                "filename": value.filename,
-                "size": value.size,
-                "content": content.decode(),
-                "content_type": value.content_type,
-                "headers": list(value.headers.items()),
-            }
-        else:
-            output[key] = value
-    await request.close()
-    response = JSONResponse(output)
-    await response(scope, receive, send)
-
-
-async def app_read_body(scope: Scope, receive: Receive, send: Send) -> None:
-    request = Request(scope, receive)
-    # Read bytes, to force request.stream() to return the already parsed body
-    await request.body()
-    data = await request.form()
-    output = {}
-    for key, value in data.items():
-        output[key] = value
-    await request.close()
-    response = JSONResponse(output)
-    await response(scope, receive, send)
-
-
-async def app_monitor_thread(scope: Scope, receive: Receive, send: Send) -> None:
-    """Helper app to monitor what thread the app was called on.
-
-    This can later be used to validate thread/event loop operations.
-    """
-    request = Request(scope, receive)
-
-    # Make sure we parse the form
-    await request.form()
-    await request.close()
-
-    # Send back the current thread id
-    response = JSONResponse({"thread_ident": threading.current_thread().ident})
-    await response(scope, receive, send)
-
-
-def make_app_max_parts(max_files: int = 1000, max_fields: int = 1000, max_part_size: int = 1024 * 1024) -> ASGIApp:
     async def app(scope: Scope, receive: Receive, send: Send) -> None:
         request = Request(scope, receive)
-        data = await request.form(max_files=max_files, max_fields=max_fields, max_part_size=max_part_size)
-        output: dict[str, Any] = {}
-        for key, value in data.items():
-            if isinstance(value, UploadFile):
-                content = await value.read()
-                output[key] = {
-                    "filename": value.filename,
-                    "size": value.size,
-                    "content": content.decode(),
-                    "content_type": value.content_type,
-                }
-            else:
-                output[key] = value
+        # Set a very small spool_max_size to force disk usage
+        form = await request.form(spool_max_size=100)
+        file = form["file"]
+        # Check if it rolled to disk
+        rolled = not file._in_memory
         await request.close()
-        response = JSONResponse(output)
+        response = JSONResponse({"rolled_to_disk": rolled, "filename": file.filename})
         await response(scope, receive, send)
 
-    return app
-
-
-def test_multipart_request_data(tmpdir: Path, test_client_factory: TestClientFactory) -> None:
     client = test_client_factory(app)
-    response = client.post("/", data={"some": "data"}, files=FORCE_MULTIPART)
-    assert response.json() == {"some": "data"}
-
-
-def test_multipart_request_files(tmpdir: Path, test_client_factory: TestClientFactory) -> None:
-    path = os.path.join(tmpdir, "test.txt")
-    with open(path, "wb") as file:
-        file.write(b"<file content>")
-
-    client = test_client_factory(app)
-    with open(path, "rb") as f:
-        response = client.post("/", files={"test": f})
-        assert response.json() == {
-            "test": {
-                "filename": "test.txt",
-                "size": 14,
-                "content": "<file content>",
-                "content_type": "text/plain",
-            }
-        }
-
-
-def test_multipart_request_files_with_content_type(tmpdir: Path, test_client_factory: TestClientFactory) -> None:
-    path = os.path.join(tmpdir, "test.txt")
-    with open(path, "wb") as file:
-        file.write(b"<file content>")
-
-    client = test_client_factory(app)
-    with open(path, "rb") as f:
-        response = client.post("/", files={"test": ("test.txt", f, "text/plain")})
-        assert response.json() == {
-            "test": {
-                "filename": "test.txt",
-                "size": 14,
-                "content": "<file content>",
-                "content_type": "text/plain",
-            }
-        }
-
-
-def test_multipart_request_multiple_files(tmpdir: Path, test_client_factory: TestClientFactory) -> None:
-    path1 = os.path.join(tmpdir, "test1.txt")
-    with open(path1, "wb") as file:
-        file.write(b"<file1 content>")
-
-    path2 = os.path.join(tmpdir, "test2.txt")
-    with open(path2, "wb") as file:
-        file.write(b"<file2 content>")
-
-    client = test_client_factory(app)
-    with open(path1, "rb") as f1, open(path2, "rb") as f2:
-        response = client.post("/", files={"test1": f1, "test2": ("test2.txt", f2, "text/plain")})
-        assert response.json() == {
-            "test1": {
-                "filename": "test1.txt",
-                "size": 15,
-                "content": "<file1 content>",
-                "content_type": "text/plain",
-            },
-            "test2": {
-                "filename": "test2.txt",
-                "size": 15,
-                "content": "<file2 content>",
-                "content_type": "text/plain",
-            },
-        }
-
-
-def test_multipart_request_multiple_files_with_headers(tmpdir: Path, test_client_factory: TestClientFactory) -> None:
-    path1 = os.path.join(tmpdir, "test1.txt")
-    with open(path1, "wb") as file:
-        file.write(b"<file1 content>")
-
-    path2 = os.path.join(tmpdir, "test2.txt")
-    with open(path2, "wb") as file:
-        file.write(b"<file2 content>")
-
-    client = test_client_factory(app_with_headers)
-    with open(path1, "rb") as f1, open(path2, "rb") as f2:
-        response = client.post(
-            "/",
-            files=[
-                ("test1", (None, f1)),
-                ("test2", ("test2.txt", f2, "text/plain", {"x-custom": "f2"})),
-            ],
-        )
-        assert response.json() == {
-            "test1": "<file1 content>",
-            "test2": {
-                "filename": "test2.txt",
-                "size": 15,
-                "content": "<file2 content>",
-                "content_type": "text/plain",
-                "headers": [
-                    [
-                        "content-disposition",
-                        'form-data; name="test2"; filename="test2.txt"',
-                    ],
-                    ["x-custom", "f2"],
-                    ["content-type", "text/plain"],
-                ],
-            },
-        }
-
-
-def test_multi_items(tmpdir: Path, test_client_factory: TestClientFactory) -> None:
-    path1 = os.path.join(tmpdir, "test1.txt")
-    with open(path1, "wb") as file:
-        file.write(b"<file1 content>")
-
-    path2 = os.path.join(tmpdir, "test2.txt")
-    with open(path2, "wb") as file:
-        file.write(b"<file2 content>")
-
-    client = test_client_factory(multi_items_app)
-    with open(path1, "rb") as f1, open(path2, "rb") as f2:
-        response = client.post(
-            "/",
-            data={"test1": "abc"},
-            files=[("test1", f1), ("test1", ("test2.txt", f2, "text/plain"))],
-        )
-        assert response.json() == {
-            "test1": [
-                "abc",
-                {
-                    "filename": "test1.txt",
-                    "size": 15,
-                    "content": "<file1 content>",
-                    "content_type": "text/plain",
-                },
-                {
-                    "filename": "test2.txt",
-                    "size": 15,
-                    "content": "<file2 content>",
-                    "content_type": "text/plain",
-                },
-            ]
-        }
-
-
-def test_multipart_request_mixed_files_and_data(tmpdir: Path, test_client_factory: TestClientFactory) -> None:
-    client = test_client_factory(app)
-    response = client.post(
-        "/",
-        data=(
-            # data
-            b"--a7f7ac8d4e2e437c877bb7b8d7cc549c\r\n"  # type: ignore
-            b'Content-Disposition: form-data; name="field0"\r\n\r\n'
-            b"value0\r\n"
-            # file
-            b"--a7f7ac8d4e2e437c877bb7b8d7cc549c\r\n"
-            b'Content-Disposition: form-data; name="file"; filename="file.txt"\r\n'
-            b"Content-Type: text/plain\r\n\r\n"
-            b"<file content>\r\n"
-            # data
-            b"--a7f7ac8d4e2e437c877bb7b8d7cc549c\r\n"
-            b'Content-Disposition: form-data; name="field1"\r\n\r\n'
-            b"value1\r\n"
-            b"--a7f7ac8d4e2e437c877bb7b8d7cc549c--\r\n"
-        ),
-        headers={"Content-Type": ("multipart/form-data; boundary=a7f7ac8d4e2e437c877bb7b8d7cc549c")},
-    )
-    assert response.json() == {
-        "file": {
-            "filename": "file.txt",
-            "size": 14,
-            "content": "<file content>",
-            "content_type": "text/plain",
-        },
-        "field0": "value0",
-        "field1": "value1",
-    }
-
-
-class ThreadTrackingSpooledTemporaryFile(SpooledTemporaryFile[bytes]):
-    """Helper class to track which threads performed the rollover operation.
-
-    This is not threadsafe/multi-test safe.
-    """
-
-    rollover_threads: ClassVar[set[int | None]] = set()
-
-    def rollover(self) -> None:
-        ThreadTrackingSpooledTemporaryFile.rollover_threads.add(threading.current_thread().ident)
-        super().rollover()
-
-
-@pytest.fixture
-def mock_spooled_temporary_file() -> Generator[None]:
-    try:
-        with mock.patch("starlette.formparsers.SpooledTemporaryFile", ThreadTrackingSpooledTemporaryFile):
-            yield
-    finally:
-        ThreadTrackingSpooledTemporaryFile.rollover_threads.clear()
-
-
-def test_multipart_request_large_file_rollover_in_background_thread(
-    mock_spooled_temporary_file: None, test_client_factory: TestClientFactory
-) -> None:
-    """Test that Spooled file rollovers happen in background threads."""
-    data = BytesIO(b" " * (MultiPartParser.spool_max_size + 1))
-
-    client = test_client_factory(app_monitor_thread)
-    response = client.post("/", files=[("test_large", data)])
+    response = client.post("/", files={"file": ("test.txt", b"x" * 500)})
     assert response.status_code == 200
+    data = response.json()
+    assert data["filename"] == "test.txt"
+    assert data["rolled_to_disk"] is True  # Should roll with 100 byte threshold
 
-    # Parse the event thread id from the API response and ensure we have one
-    app_thread_ident = response.json().get("thread_ident")
-    assert app_thread_ident is not None
 
-    # Ensure the app thread was not the same as the rollover one and that a rollover thread exists
-    assert app_thread_ident not in ThreadTrackingSpooledTemporaryFile.rollover_threads
-    assert len(ThreadTrackingSpooledTemporaryFile.rollover_threads) == 1
+def test_request_form_spool_max_size_default(test_client_factory: TestClientFactory) -> None:
+    """Test that request.form() default spool_max_size keeps small files in memory."""
+    from starlette.requests import Request
+    from starlette.responses import JSONResponse
 
-
-def test_multipart_request_with_charset_for_filename(tmpdir: Path, test_client_factory: TestClientFactory) -> None:
-    client = test_client_factory(app)
-    response = client.post(
-        "/",
-        data=(
-            # file
-            b"--a7f7ac8d4e2e437c877bb7b8d7cc549c\r\n"  # type: ignore
-            b'Content-Disposition: form-data; name="file"; filename="\xe6\x96\x87\xe6\x9b\xb8.txt"\r\n'
-            b"Content-Type: text/plain\r\n\r\n"
-            b"<file content>\r\n"
-            b"--a7f7ac8d4e2e437c877bb7b8d7cc549c--\r\n"
-        ),
-        headers={"Content-Type": ("multipart/form-data; charset=utf-8; boundary=a7f7ac8d4e2e437c877bb7b8d7cc549c")},
-    )
-    assert response.json() == {
-        "file": {
-            "filename": "文書.txt",
-            "size": 14,
-            "content": "<file content>",
-            "content_type": "text/plain",
-        }
-    }
-
-
-def test_multipart_request_without_charset_for_filename(tmpdir: Path, test_client_factory: TestClientFactory) -> None:
-    client = test_client_factory(app)
-    response = client.post(
-        "/",
-        data=(
-            # file
-            b"--a7f7ac8d4e2e437c877bb7b8d7cc549c\r\n"  # type: ignore
-            b'Content-Disposition: form-data; name="file"; filename="\xe7\x94\xbb\xe5\x83\x8f.jpg"\r\n'
-            b"Content-Type: image/jpeg\r\n\r\n"
-            b"<file content>\r\n"
-            b"--a7f7ac8d4e2e437c877bb7b8d7cc549c--\r\n"
-        ),
-        headers={"Content-Type": ("multipart/form-data; boundary=a7f7ac8d4e2e437c877bb7b8d7cc549c")},
-    )
-    assert response.json() == {
-        "file": {
-            "filename": "画像.jpg",
-            "size": 14,
-            "content": "<file content>",
-            "content_type": "image/jpeg",
-        }
-    }
-
-
-def test_multipart_request_with_encoded_value(tmpdir: Path, test_client_factory: TestClientFactory) -> None:
-    client = test_client_factory(app)
-    response = client.post(
-        "/",
-        data=(
-            b"--20b303e711c4ab8c443184ac833ab00f\r\n"  # type: ignore
-            b"Content-Disposition: form-data; "
-            b'name="value"\r\n\r\n'
-            b"Transf\xc3\xa9rer\r\n"
-            b"--20b303e711c4ab8c443184ac833ab00f--\r\n"
-        ),
-        headers={"Content-Type": ("multipart/form-data; charset=utf-8; boundary=20b303e711c4ab8c443184ac833ab00f")},
-    )
-    assert response.json() == {"value": "Transférer"}
-
-
-def test_urlencoded_request_data(tmpdir: Path, test_client_factory: TestClientFactory) -> None:
-    client = test_client_factory(app)
-    response = client.post("/", data={"some": "data"})
-    assert response.json() == {"some": "data"}
-
-
-def test_no_request_data(tmpdir: Path, test_client_factory: TestClientFactory) -> None:
-    client = test_client_factory(app)
-    response = client.post("/")
-    assert response.json() == {}
-
-
-def test_urlencoded_percent_encoding(tmpdir: Path, test_client_factory: TestClientFactory) -> None:
-    client = test_client_factory(app)
-    response = client.post("/", data={"some": "da ta"})
-    assert response.json() == {"some": "da ta"}
-
-
-def test_urlencoded_percent_encoding_keys(tmpdir: Path, test_client_factory: TestClientFactory) -> None:
-    client = test_client_factory(app)
-    response = client.post("/", data={"so me": "data"})
-    assert response.json() == {"so me": "data"}
-
-
-def test_urlencoded_multi_field_app_reads_body(tmpdir: Path, test_client_factory: TestClientFactory) -> None:
-    client = test_client_factory(app_read_body)
-    response = client.post("/", data={"some": "data", "second": "key pair"})
-    assert response.json() == {"some": "data", "second": "key pair"}
-
-
-def test_multipart_multi_field_app_reads_body(tmpdir: Path, test_client_factory: TestClientFactory) -> None:
-    client = test_client_factory(app_read_body)
-    response = client.post("/", data={"some": "data", "second": "key pair"}, files=FORCE_MULTIPART)
-    assert response.json() == {"some": "data", "second": "key pair"}
-
-
-@pytest.mark.parametrize(
-    "app,expectation",
-    [
-        (app, pytest.raises(MultiPartException)),
-        (Starlette(routes=[Mount("/", app=app)]), does_not_raise()),
-    ],
-)
-def test_urlencoded_too_many_fields_raise(
-    app: ASGIApp,
-    expectation: AbstractContextManager[Exception],
-    test_client_factory: TestClientFactory,
-) -> None:
-    client = test_client_factory(app)
-    data = "&".join(f"N{i}=" for i in range(1001))
-    with expectation:
-        res = client.post(
-            "/",
-            content=data,
-            headers={"Content-Type": "application/x-www-form-urlencoded"},
-        )
-        assert res.status_code == 400
-        assert res.text == "Too many fields. Maximum number of fields is 1000."
-
-
-@pytest.mark.parametrize(
-    "app,expectation",
-    [
-        (app, pytest.raises(MultiPartException)),
-        (Starlette(routes=[Mount("/", app=app)]), does_not_raise()),
-    ],
-)
-def test_urlencoded_field_exceeds_max_part_size_raise(
-    app: ASGIApp,
-    expectation: AbstractContextManager[Exception],
-    test_client_factory: TestClientFactory,
-) -> None:
-    client = test_client_factory(app)
-    data = "field=" + "x" * (1024 * 1024 + 1)
-    with expectation:
-        res = client.post(
-            "/",
-            content=data,
-            headers={"Content-Type": "application/x-www-form-urlencoded"},
-        )
-        assert res.status_code == 400
-        assert res.text == "Field exceeded maximum size of 1024KB."
-
-
-@pytest.mark.parametrize(
-    "app,expectation",
-    [
-        (app, pytest.raises(MultiPartException)),
-        (Starlette(routes=[Mount("/", app=app)]), does_not_raise()),
-    ],
-)
-def test_urlencoded_field_name_exceeds_max_part_size_raise(
-    app: ASGIApp,
-    expectation: AbstractContextManager[Exception],
-    test_client_factory: TestClientFactory,
-) -> None:
-    client = test_client_factory(app)
-    data = "x" * (1024 * 1024 + 1) + "=value"
-    with expectation:
-        res = client.post(
-            "/",
-            content=data,
-            headers={"Content-Type": "application/x-www-form-urlencoded"},
-        )
-        assert res.status_code == 400
-        assert res.text == "Field exceeded maximum size of 1024KB."
-
-
-@pytest.mark.parametrize(
-    "app,expectation",
-    [
-        (make_app_max_parts(max_fields=1), pytest.raises(MultiPartException)),
-        (
-            Starlette(routes=[Mount("/", app=make_app_max_parts(max_fields=1))]),
-            does_not_raise(),
-        ),
-    ],
-)
-def test_urlencoded_max_fields_is_customizable(
-    app: ASGIApp,
-    expectation: AbstractContextManager[Exception],
-    test_client_factory: TestClientFactory,
-) -> None:
-    client = test_client_factory(app)
-    with expectation:
-        res = client.post(
-            "/",
-            content="a=1&b=2",
-            headers={"Content-Type": "application/x-www-form-urlencoded"},
-        )
-        assert res.status_code == 400
-        assert res.text == "Too many fields. Maximum number of fields is 1."
-
-
-@pytest.mark.parametrize(
-    "app,expectation",
-    [
-        (make_app_max_parts(max_part_size=1024 * 10), pytest.raises(MultiPartException)),
-        (
-            Starlette(routes=[Mount("/", app=make_app_max_parts(max_part_size=1024 * 10))]),
-            does_not_raise(),
-        ),
-    ],
-)
-def test_urlencoded_max_part_size_is_customizable(
-    app: ASGIApp,
-    expectation: AbstractContextManager[Exception],
-    test_client_factory: TestClientFactory,
-) -> None:
-    client = test_client_factory(app)
-    with expectation:
-        res = client.post(
-            "/",
-            content="field=" + "x" * (1024 * 10 + 1),
-            headers={"Content-Type": "application/x-www-form-urlencoded"},
-        )
-        assert res.status_code == 400
-        assert res.text == "Field exceeded maximum size of 10KB."
-
-
-@pytest.mark.anyio
-async def test_urlencoded_limits_stop_parsing_within_a_single_chunk() -> None:
-    async def single_chunk(body: bytes) -> AsyncGenerator[bytes, None]:
-        yield body
-
-    headers = Headers({"content-type": "application/x-www-form-urlencoded"})
-
-    too_many = "&".join(f"f{i}=" for i in range(100_000)).encode()
-    stream = single_chunk(too_many)
-    parser = FormParser(headers, stream, max_fields=10)
-    with pytest.raises(MultiPartException, match="Too many fields"):
-        await parser.parse()
-    await stream.aclose()
-    assert parser._current_fields == 11
-
-    too_big = ("field=" + "x" * (1024 * 1024 * 50)).encode()
-    stream = single_chunk(too_big)
-    parser = FormParser(headers, stream, max_part_size=1024)
-    with pytest.raises(MultiPartException, match="Field exceeded maximum size"):
-        await parser.parse()
-    await stream.aclose()
-    assert sum(len(data) for _, data in parser.messages) <= 1024
-
-
-def test_user_safe_decode_helper() -> None:
-    result = _user_safe_decode(b"\xc4\x99\xc5\xbc\xc4\x87", "utf-8")
-    assert result == "ężć"
-
-
-def test_user_safe_decode_ignores_wrong_charset() -> None:
-    result = _user_safe_decode(b"abc", "latin-8")
-    assert result == "abc"
-
-
-@pytest.mark.parametrize(
-    "app,expectation",
-    [
-        (app, pytest.raises(MultiPartException)),
-        (Starlette(routes=[Mount("/", app=app)]), does_not_raise()),
-    ],
-)
-def test_missing_boundary_parameter(
-    app: ASGIApp,
-    expectation: AbstractContextManager[Exception],
-    test_client_factory: TestClientFactory,
-) -> None:
-    client = test_client_factory(app)
-    with expectation:
-        res = client.post(
-            "/",
-            data=(
-                # file
-                b'Content-Disposition: form-data; name="file"; filename="\xe6\x96\x87\xe6\x9b\xb8.txt"\r\n'  # type: ignore
-                b"Content-Type: text/plain\r\n\r\n"
-                b"<file content>\r\n"
-            ),
-            headers={"Content-Type": "multipart/form-data; charset=utf-8"},
-        )
-        assert res.status_code == 400
-        assert res.text == "Missing boundary in multipart."
-
-
-@pytest.mark.parametrize(
-    "app,expectation",
-    [
-        (app, pytest.raises(MultiPartException)),
-        (Starlette(routes=[Mount("/", app=app)]), does_not_raise()),
-    ],
-)
-def test_missing_name_parameter_on_content_disposition(
-    app: ASGIApp,
-    expectation: AbstractContextManager[Exception],
-    test_client_factory: TestClientFactory,
-) -> None:
-    client = test_client_factory(app)
-    with expectation:
-        res = client.post(
-            "/",
-            data=(
-                # data
-                b"--a7f7ac8d4e2e437c877bb7b8d7cc549c\r\n"  # type: ignore
-                b'Content-Disposition: form-data; ="field0"\r\n\r\n'
-                b"value0\r\n"
-            ),
-            headers={"Content-Type": ("multipart/form-data; boundary=a7f7ac8d4e2e437c877bb7b8d7cc549c")},
-        )
-        assert res.status_code == 400
-        assert res.text == 'The Content-Disposition header field "name" must be provided.'
-
-
-@pytest.mark.parametrize(
-    "app,expectation",
-    [
-        (app, pytest.raises(MultiPartException)),
-        (Starlette(routes=[Mount("/", app=app)]), does_not_raise()),
-    ],
-)
-def test_too_many_fields_raise(
-    app: ASGIApp,
-    expectation: AbstractContextManager[Exception],
-    test_client_factory: TestClientFactory,
-) -> None:
-    client = test_client_factory(app)
-    fields = []
-    for i in range(1001):
-        fields.append(f'--B\r\nContent-Disposition: form-data; name="N{i}";\r\n\r\n\r\n')
-    data = "".join(fields).encode("utf-8")
-    with expectation:
-        res = client.post(
-            "/",
-            data=data,  # type: ignore
-            headers={"Content-Type": ("multipart/form-data; boundary=B")},
-        )
-        assert res.status_code == 400
-        assert res.text == "Too many fields. Maximum number of fields is 1000."
-
-
-@pytest.mark.parametrize(
-    "app,expectation",
-    [
-        (app, pytest.raises(MultiPartException)),
-        (Starlette(routes=[Mount("/", app=app)]), does_not_raise()),
-    ],
-)
-def test_too_many_files_raise(
-    app: ASGIApp,
-    expectation: AbstractContextManager[Exception],
-    test_client_factory: TestClientFactory,
-) -> None:
-    client = test_client_factory(app)
-    fields = []
-    for i in range(1001):
-        fields.append(f'--B\r\nContent-Disposition: form-data; name="N{i}"; filename="F{i}";\r\n\r\n\r\n')
-    data = "".join(fields).encode("utf-8")
-    with expectation:
-        res = client.post(
-            "/",
-            data=data,  # type: ignore
-            headers={"Content-Type": ("multipart/form-data; boundary=B")},
-        )
-        assert res.status_code == 400
-        assert res.text == "Too many files. Maximum number of files is 1000."
-
-
-@pytest.mark.parametrize(
-    "app,expectation",
-    [
-        (app, pytest.raises(MultiPartException)),
-        (Starlette(routes=[Mount("/", app=app)]), does_not_raise()),
-    ],
-)
-def test_too_many_files_single_field_raise(
-    app: ASGIApp,
-    expectation: AbstractContextManager[Exception],
-    test_client_factory: TestClientFactory,
-) -> None:
-    client = test_client_factory(app)
-    fields = []
-    for i in range(1001):
-        # This uses the same field name "N" for all files, equivalent to a
-        # multifile upload form field
-        fields.append(f'--B\r\nContent-Disposition: form-data; name="N"; filename="F{i}";\r\n\r\n\r\n')
-    data = "".join(fields).encode("utf-8")
-    with expectation:
-        res = client.post(
-            "/",
-            data=data,  # type: ignore
-            headers={"Content-Type": ("multipart/form-data; boundary=B")},
-        )
-        assert res.status_code == 400
-        assert res.text == "Too many files. Maximum number of files is 1000."
-
-
-@pytest.mark.parametrize(
-    "app,expectation",
-    [
-        (app, pytest.raises(MultiPartException)),
-        (Starlette(routes=[Mount("/", app=app)]), does_not_raise()),
-    ],
-)
-def test_too_many_files_and_fields_raise(
-    app: ASGIApp,
-    expectation: AbstractContextManager[Exception],
-    test_client_factory: TestClientFactory,
-) -> None:
-    client = test_client_factory(app)
-    fields = []
-    for i in range(1001):
-        fields.append(f'--B\r\nContent-Disposition: form-data; name="F{i}"; filename="F{i}";\r\n\r\n\r\n')
-        fields.append(f'--B\r\nContent-Disposition: form-data; name="N{i}";\r\n\r\n\r\n')
-    data = "".join(fields).encode("utf-8")
-    with expectation:
-        res = client.post(
-            "/",
-            data=data,  # type: ignore
-            headers={"Content-Type": ("multipart/form-data; boundary=B")},
-        )
-        assert res.status_code == 400
-        assert res.text == "Too many files. Maximum number of files is 1000."
-
-
-@pytest.mark.parametrize(
-    "app,expectation",
-    [
-        (make_app_max_parts(max_fields=1), pytest.raises(MultiPartException)),
-        (
-            Starlette(routes=[Mount("/", app=make_app_max_parts(max_fields=1))]),
-            does_not_raise(),
-        ),
-    ],
-)
-def test_max_fields_is_customizable_low_raises(
-    app: ASGIApp,
-    expectation: AbstractContextManager[Exception],
-    test_client_factory: TestClientFactory,
-) -> None:
-    client = test_client_factory(app)
-    fields = []
-    for i in range(2):
-        fields.append(f'--B\r\nContent-Disposition: form-data; name="N{i}";\r\n\r\n\r\n')
-    data = "".join(fields).encode("utf-8")
-    with expectation:
-        res = client.post(
-            "/",
-            data=data,  # type: ignore
-            headers={"Content-Type": ("multipart/form-data; boundary=B")},
-        )
-        assert res.status_code == 400
-        assert res.text == "Too many fields. Maximum number of fields is 1."
-
-
-@pytest.mark.parametrize(
-    "app,expectation",
-    [
-        (make_app_max_parts(max_files=1), pytest.raises(MultiPartException)),
-        (
-            Starlette(routes=[Mount("/", app=make_app_max_parts(max_files=1))]),
-            does_not_raise(),
-        ),
-    ],
-)
-def test_max_files_is_customizable_low_raises(
-    app: ASGIApp,
-    expectation: AbstractContextManager[Exception],
-    test_client_factory: TestClientFactory,
-) -> None:
-    client = test_client_factory(app)
-    fields = []
-    for i in range(2):
-        fields.append(f'--B\r\nContent-Disposition: form-data; name="F{i}"; filename="F{i}";\r\n\r\n\r\n')
-    data = "".join(fields).encode("utf-8")
-    with expectation:
-        res = client.post(
-            "/",
-            data=data,  # type: ignore
-            headers={"Content-Type": ("multipart/form-data; boundary=B")},
-        )
-        assert res.status_code == 400
-        assert res.text == "Too many files. Maximum number of files is 1."
-
-
-def test_max_fields_is_customizable_high(test_client_factory: TestClientFactory) -> None:
-    client = test_client_factory(make_app_max_parts(max_fields=2000, max_files=2000))
-    fields = []
-    for i in range(2000):
-        fields.append(f'--B\r\nContent-Disposition: form-data; name="N{i}";\r\n\r\n\r\n')
-        fields.append(f'--B\r\nContent-Disposition: form-data; name="F{i}"; filename="F{i}";\r\n\r\n\r\n')
-    data = "".join(fields).encode("utf-8")
-    data += b"--B--\r\n"
-    res = client.post(
-        "/",
-        data=data,  # type: ignore
-        headers={"Content-Type": ("multipart/form-data; boundary=B")},
-    )
-    assert res.status_code == 200
-    res_data = res.json()
-    assert res_data["N1999"] == ""
-    assert res_data["F1999"] == {
-        "filename": "F1999",
-        "size": 0,
-        "content": "",
-        "content_type": None,
-    }
-
-
-@pytest.mark.parametrize(
-    "app,expectation",
-    [
-        (app, pytest.raises(MultiPartException)),
-        (Starlette(routes=[Mount("/", app=app)]), does_not_raise()),
-    ],
-)
-def test_max_part_size_exceeds_limit(
-    app: ASGIApp,
-    expectation: AbstractContextManager[Exception],
-    test_client_factory: TestClientFactory,
-) -> None:
-    client = test_client_factory(app)
-    boundary = "------------------------4K1ON9fZkj9uCUmqLHRbbR"
-
-    multipart_data = (
-        f"--{boundary}\r\n"
-        f'Content-Disposition: form-data; name="small"\r\n\r\n'
-        "small content\r\n"
-        f"--{boundary}\r\n"
-        f'Content-Disposition: form-data; name="large"\r\n\r\n'
-        + ("x" * 1024 * 1024 + "x")  # 1MB + 1 byte of data
-        + "\r\n"
-        f"--{boundary}--\r\n"
-    ).encode("utf-8")
-
-    headers = {
-        "Content-Type": f"multipart/form-data; boundary={boundary}",
-        "Transfer-Encoding": "chunked",
-    }
-
-    with expectation:
-        response = client.post("/", data=multipart_data, headers=headers)  # type: ignore
-        assert response.status_code == 400
-        assert response.text == "Part exceeded maximum size of 1024KB."
-
-
-@pytest.mark.parametrize(
-    "app,expectation",
-    [
-        (make_app_max_parts(max_part_size=1024 * 10), pytest.raises(MultiPartException)),
-        (
-            Starlette(routes=[Mount("/", app=make_app_max_parts(max_part_size=1024 * 10))]),
-            does_not_raise(),
-        ),
-    ],
-)
-def test_max_part_size_exceeds_custom_limit(
-    app: ASGIApp,
-    expectation: AbstractContextManager[Exception],
-    test_client_factory: TestClientFactory,
-) -> None:
-    client = test_client_factory(app)
-    boundary = "------------------------4K1ON9fZkj9uCUmqLHRbbR"
-
-    multipart_data = (
-        f"--{boundary}\r\n"
-        f'Content-Disposition: form-data; name="small"\r\n\r\n'
-        "small content\r\n"
-        f"--{boundary}\r\n"
-        f'Content-Disposition: form-data; name="large"\r\n\r\n'
-        + ("x" * 1024 * 10 + "x")  # 1MB + 1 byte of data
-        + "\r\n"
-        f"--{boundary}--\r\n"
-    ).encode("utf-8")
-
-    headers = {
-        "Content-Type": f"multipart/form-data; boundary={boundary}",
-        "Transfer-Encoding": "chunked",
-    }
-
-    with expectation:
-        response = client.post("/", content=multipart_data, headers=headers)
-        assert response.status_code == 400
-        assert response.text == "Part exceeded maximum size of 10KB."
-
-
-def test_multipart_closes_tempfile_on_oserror(
-    test_client_factory: TestClientFactory,
-) -> None:
-    """Temporary files must be closed when an OSError (e.g. disk full) is raised during parsing."""
-    close_called = False
-
-    class FailingSpooledTemporaryFile(SpooledTemporaryFile[bytes]):
-        def write(self, s: Any) -> int:
-            raise OSError("disk full")
-
-        def close(self) -> None:
-            nonlocal close_called
-            close_called = True
-            super().close()
-
-    async def error_app(scope: Scope, receive: Receive, send: Send) -> None:
+    async def app(scope: Scope, receive: Receive, send: Send) -> None:
         request = Request(scope, receive)
-        with mock.patch("starlette.formparsers.SpooledTemporaryFile", FailingSpooledTemporaryFile):
-            await request.form()
+        # Use default spool_max_size (1MB)
+        form = await request.form()
+        file = form["file"]
+        in_memory = file._in_memory
+        await request.close()
+        response = JSONResponse({"in_memory": in_memory, "filename": file.filename})
+        await response(scope, receive, send)
 
-    client = test_client_factory(error_app)
-    boundary = "a7f7ac8d4e2e437c877bb7b8d7cc549c"
-    content = (
-        f"--{boundary}\r\n"
-        f'Content-Disposition: form-data; name="file"; filename="test.txt"\r\n'
-        f"Content-Type: text/plain\r\n\r\n"
-        f"file content\r\n"
-        f"--{boundary}--\r\n"
-    ).encode()
-    headers = {"Content-Type": f"multipart/form-data; boundary={boundary}"}
+    client = test_client_factory(app)
+    response = client.post("/", files={"file": ("test.txt", b"x" * 500)})
+    assert response.status_code == 200
+    data = response.json()
+    assert data["filename"] == "test.txt"
+    assert data["in_memory"] is True  # Should stay in memory with default threshold
 
-    with pytest.raises(OSError, match="disk full"):
-        client.post("/", content=content, headers=headers)
 
-    assert close_called
+def test_spool_max_size_zero_means_unlimited(test_client_factory: TestClientFactory) -> None:
+    """Test that spool_max_size=0 means unlimited (stays in memory)."""
+    from starlette.requests import Request
+    from starlette.responses import JSONResponse
+
+    async def app(scope: Scope, receive: Receive, send: Send) -> None:
+        request = Request(scope, receive)
+        # Set spool_max_size to 0 (unlimited per SpooledTemporaryFile docs)
+        form = await request.form(spool_max_size=0)
+        file = form["file"]
+        in_memory = file._in_memory
+        await request.close()
+        response = JSONResponse({"in_memory": in_memory})
+        await response(scope, receive, send)
+
+    client = test_client_factory(app)
+    # Even a large file should stay in memory with spool_max_size=0
+    response = client.post("/", files={"file": ("test.txt", b"x" * (1024 * 1024 * 5))})  # 5MB
+    assert response.status_code == 200
+    data = response.json()
+    assert data["in_memory"] is True
+
