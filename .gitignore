@@ -1,14 +1,37 @@
-*.pyc
-test.db
-.coverage
-.pytest_cache/
-.mypy_cache/
+# Python
 __pycache__/
-htmlcov/
-site/
+*.py[cod]
+*$py.class
+*.so
 *.egg-info/
-venv*/
-.venv/
-.python-version
-build/
+*.egg
 dist/
+build/
+.eggs/
+.venv/
+venv/
+env/
+*.whl
+
+# Go
+vendor/
+go.sum
+
+# Node / npm
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+package-lock.json
+yarn.lock
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
