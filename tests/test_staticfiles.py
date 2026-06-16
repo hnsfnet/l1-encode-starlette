@@ -4,6 +4,7 @@ import tempfile
 import time
 from pathlib import Path
 from typing import Any
+from unittest import mock
 
 import anyio
 import pytest
@@ -77,6 +78,230 @@ def test_staticfiles_with_package(test_client_factory: TestClientFactory) -> Non
     response = client.get("/example.txt")
     assert response.status_code == 200
     assert response.text == "123\n"
+
+
+def test_staticfiles_precompressed_without_accept_encoding(tmpdir: Path, test_client_factory: TestClientFactory) -> None:
+    path = os.path.join(tmpdir, "example.txt")
+    with open(path, "w") as file:
+        file.write("uncompressed content")
+
+    app = StaticFiles(directory=tmpdir)
+    client = test_client_factory(app)
+    response = client.get("/example.txt")
+    assert response.status_code == 200
+    assert response.text == "uncompressed content"
+    assert "content-encoding" not in response.headers
+    assert response.headers.get("vary") == "Accept-Encoding"
+
+
+def test_staticfiles_precompressed_with_brotli(tmpdir: Path, test_client_factory: TestClientFactory) -> None:
+    path = os.path.join(tmpdir, "app.js")
+    with open(path, "w") as file:
+        file.write("var x = 1;")
+
+    # Create a .br compressed version (just use some dummy content for testing)
+    br_path = path + ".br"
+    with open(br_path, "wb") as file:
+        file.write(b"\x1b\x00\x00\x00\x00\x00\x00\x00")  # Minimal valid brotli header + content
+
+    app = StaticFiles(directory=tmpdir)
+    client = test_client_factory(app)
+
+    # With Accept-Encoding: br, should serve the .br file
+    response = client.get("/app.js", headers={"Accept-Encoding": "br"})
+    assert response.status_code == 200
+    assert response.headers["content-encoding"] == "br"
+    assert response.headers.get("vary") == "Accept-Encoding"
+    # Note: mimetypes.guess_type returns 'text/javascript' for .js files
+    assert response.headers["content-type"] in ("application/javascript", "text/javascript")
+
+    # Without Accept-Encoding, should serve uncompressed
+    response = client.get("/app.js")
+    assert response.status_code == 200
+    assert "content-encoding" not in response.headers
+    assert response.text == "var x = 1;"
+
+
+def test_staticfiles_precompressed_with_gzip(tmpdir: Path, test_client_factory: TestClientFactory) -> None:
+    path = os.path.join(tmpdir, "style.css")
+    with open(path, "w") as file:
+        file.write("body { color: red; }")
+
+    # Create a .gz compressed version
+    import gzip
+    gz_path = path + ".gz"
+    with gzip.open(gz_path, "wb") as f:
+        f.write(b"body { color: red; }")
+
+    app = StaticFiles(directory=tmpdir)
+    client = test_client_factory(app)
+
+    # With Accept-Encoding: gzip, should serve the .gz file
+    response = client.get("/style.css", headers={"Accept-Encoding": "gzip"})
+    assert response.status_code == 200
+    assert response.headers["content-encoding"] == "gzip"
+    assert response.headers.get("vary") == "Accept-Encoding"
+    # Note: mimetypes.guess_type returns 'text/css' for .css files
+    assert "text/css" in response.headers["content-type"]
+
+    # With Accept-Encoding: gzip, q=1.0, should also work
+    response = client.get("/style.css", headers={"Accept-Encoding": "gzip, q=1.0"})
+    assert response.status_code == 200
+    assert response.headers["content-encoding"] == "gzip"
+
+    # Without Accept-Encoding, should serve uncompressed
+    # We need to explicitly set Accept-Encoding to identity to override the TestClient's default
+    response = client.get("/style.css", headers={"Accept-Encoding": "identity"})
+    assert response.status_code == 200
+    assert "content-encoding" not in response.headers
+    assert response.text == "body { color: red; }"
+
+
+def test_staticfiles_precompressed_brotli_preferred_over_gzip(tmpdir: Path, test_client_factory: TestClientFactory) -> None:
+    path = os.path.join(tmpdir, "bundle.js")
+    with open(path, "w") as file:
+        file.write("console.log('hello');")
+
+    # Create both .br and .gz versions
+    br_path = path + ".br"
+    with open(br_path, "wb") as file:
+        file.write(b"\x1b\x00\x00\x00\x00\x00\x00\x00")
+
+    import gzip
+    gz_path = path + ".gz"
+    with gzip.open(gz_path, "wb") as f:
+        f.write(b"console.log('hello');")
+
+    app = StaticFiles(directory=tmpdir)
+    client = test_client_factory(app)
+
+    # With both br and gzip accepted, br should be preferred
+    response = client.get("/bundle.js", headers={"Accept-Encoding": "gzip, br"})
+    assert response.status_code == 200
+    assert response.headers["content-encoding"] == "br"
+
+    # With only gzip accepted, gzip should be served
+    response = client.get("/bundle.js", headers={"Accept-Encoding": "gzip"})
+    assert response.status_code == 200
+    assert response.headers["content-encoding"] == "gzip"
+
+    # With Accept-Encoding: identity, should serve uncompressed
+    response = client.get("/bundle.js", headers={"Accept-Encoding": "identity"})
+    assert response.status_code == 200
+    assert "content-encoding" not in response.headers
+    assert response.text == "console.log('hello');"
+
+
+def test_staticfiles_precompressed_fallback_to_uncompressed(tmpdir: Path, test_client_factory: TestClientFactory) -> None:
+    path = os.path.join(tmpdir, "data.json")
+    with open(path, "w") as file:
+        file.write('{"key": "value"}')
+
+    # Don't create any compressed versions
+
+    app = StaticFiles(directory=tmpdir)
+    client = test_client_factory(app)
+
+    # Even with Accept-Encoding, should fallback to uncompressed
+    response = client.get("/data.json", headers={"Accept-Encoding": "br, gzip"})
+    assert response.status_code == 200
+    assert "content-encoding" not in response.headers
+    assert response.headers.get("vary") == "Accept-Encoding"
+    assert response.headers["content-type"] == "application/json"
+    assert response.text == '{"key": "value"}'
+
+
+def test_staticfiles_precompressed_head_method(tmpdir: Path, test_client_factory: TestClientFactory) -> None:
+    path = os.path.join(tmpdir, "page.html")
+    with open(path, "w") as file:
+        file.write("<html><body>Test</body></html>")
+
+    # Create compressed version
+    br_path = path + ".br"
+    with open(br_path, "wb") as file:
+        file.write(b"\x1b\x00\x00\x00\x00\x00\x00\x00")
+
+    app = StaticFiles(directory=tmpdir)
+    client = test_client_factory(app)
+
+    # HEAD request with Accept-Encoding should return headers but no body
+    response = client.head("/page.html", headers={"Accept-Encoding": "br"})
+    assert response.status_code == 200
+    assert response.headers["content-encoding"] == "br"
+    assert response.headers.get("vary") == "Accept-Encoding"
+    assert response.headers["content-type"] == "text/html"
+    assert response.content == b""
+
+    # Regular GET should work too
+    response = client.get("/page.html", headers={"Accept-Encoding": "br"})
+    assert response.status_code == 200
+    assert response.headers["content-encoding"] == "br"
+
+
+def test_staticfiles_precompressed_304_not_modified(tmpdir: Path, test_client_factory: TestClientFactory) -> None:
+    path = os.path.join(tmpdir, "script.js")
+    with open(path, "w") as file:
+        file.write("function test() {}")
+
+    # Create compressed version
+    br_path = path + ".br"
+    with open(br_path, "wb") as file:
+        file.write(b"\x1b\x00\x00\x00\x00\x00\x00\x00")
+
+    app = StaticFiles(directory=tmpdir)
+    client = test_client_factory(app)
+
+    # First request to get ETag
+    first_response = client.get("/script.js", headers={"Accept-Encoding": "br"})
+    assert first_response.status_code == 200
+    etag = first_response.headers["etag"]
+    last_modified = first_response.headers["last-modified"]
+
+    # Second request with matching ETag should return 304
+    second_response = client.get("/script.js", headers={"Accept-Encoding": "br", "If-None-Match": etag})
+    assert second_response.status_code == 304
+    assert second_response.content == b""
+    assert "content-encoding" not in second_response.headers  # 304 should not have body-related headers
+    assert second_response.headers.get("vary") == "Accept-Encoding"
+
+    # Third request with matching Last-Modified should also return 304
+    third_response = client.get("/script.js", headers={"Accept-Encoding": "br", "If-Modified-Since": last_modified})
+    assert third_response.status_code == 304
+
+
+def test_staticfiles_precompressed_html_mode_with_compressed_files(tmpdir: Path, test_client_factory: TestClientFactory) -> None:
+    # Create compressed index.html and 404.html
+    index_path = os.path.join(tmpdir, "index.html")
+    with open(index_path, "w") as file:
+        file.write("<h1>Home</h1>")
+
+    br_index_path = index_path + ".br"
+    with open(br_index_path, "wb") as file:
+        file.write(b"\x1b\x00\x00\x00\x00\x00\x00\x00")
+
+    notfound_path = os.path.join(tmpdir, "404.html")
+    with open(notfound_path, "w") as file:
+        file.write("<h1>Not Found</h1>")
+
+    br_notfound_path = notfound_path + ".br"
+    with open(br_notfound_path, "wb") as file:
+        file.write(b"\x1b\x00\x00\x00\x00\x00\x00\x00")
+
+    app = StaticFiles(directory=tmpdir, html=True)
+    client = test_client_factory(app)
+
+    # Should serve compressed index.html with correct content-type
+    response = client.get("/", headers={"Accept-Encoding": "br"})
+    assert response.status_code == 200
+    assert response.headers["content-encoding"] == "br"
+    assert response.headers["content-type"] == "text/html"
+    assert response.headers.get("vary") == "Accept-Encoding"
+
+    # Should serve compressed 404.html for missing files
+    response = client.get("/missing", headers={"Accept-Encoding": "br"})
+    assert response.status_code == 404
+    assert response.headers["content-encoding"] == "br"
+    assert response.headers["content-type"] == "text/html"
 
 
 def test_staticfiles_post(tmpdir: Path, test_client_factory: TestClientFactory) -> None:
@@ -406,6 +631,8 @@ def test_staticfiles_cache_invalidation_for_deleted_file_html_mode(
         "/some.html",
         headers={"If-Modified-Since": resp_exists.headers["last-modified"]},
     )
+    # When the file is deleted, we should get 404 (with the custom 404.html content)
+    # The If-Modified-Since header should be ignored since the resource no longer exists
     assert resp_deleted.status_code == 404
     assert resp_deleted.text == "<p>404 file</p>"
 

@@ -114,7 +114,7 @@ class StaticFiles:
             raise HTTPException(status_code=405)
 
         try:
-            full_path, stat_result = await anyio.to_thread.run_sync(self.lookup_path, path)
+            full_path, stat_result = await anyio.to_thread.run_sync(self.lookup_path, path, scope)
         except PermissionError:
             raise HTTPException(status_code=401)
         except OSError as exc:
@@ -135,7 +135,7 @@ class StaticFiles:
             # We're in HTML mode, and have got a directory URL.
             # Check if we have 'index.html' file to serve.
             index_path = os.path.join(path, "index.html")
-            full_path, stat_result = await anyio.to_thread.run_sync(self.lookup_path, index_path)
+            full_path, stat_result = await anyio.to_thread.run_sync(self.lookup_path, index_path, scope)
             if stat_result is not None and stat.S_ISREG(stat_result.st_mode):
                 if not scope["path"].endswith("/"):
                     # Directory URLs should redirect to always end in "/".
@@ -146,15 +146,25 @@ class StaticFiles:
 
         if self.html:
             # Check for '404.html' if we're in HTML mode.
-            full_path, stat_result = await anyio.to_thread.run_sync(self.lookup_path, "404.html")
+            full_path, stat_result = await anyio.to_thread.run_sync(self.lookup_path, "404.html", scope)
             if stat_result and stat.S_ISREG(stat_result.st_mode):
-                return FileResponse(full_path, stat_result=stat_result, status_code=404)
+                # Use file_response to handle compression for 404.html as well
+                return self.file_response(full_path, stat_result, scope, status_code=404)
         raise HTTPException(status_code=404)
 
-    def lookup_path(self, path: str) -> tuple[str, os.stat_result | None]:
+    def lookup_path(self, path: str, scope: Scope | None = None) -> tuple[str, os.stat_result | None]:
         # Reject absolute paths so they cannot escape the served directory.
         if path.startswith(("/", "\\")):
             return "", None
+
+        # Look up Accept-Encoding from scope if available for compression negotiation
+        accept_encoding = scope.get("headers", []) if scope else []
+        accepted_encodings = set()
+        for header_name, header_value in accept_encoding:
+            if header_name.lower() == b"accept-encoding":
+                accepted_encodings = {e.strip().lower() for e in header_value.decode("latin-1").split(",")}
+                break
+
         for directory in self.all_directories:
             joined_path = os.path.join(directory, path)
             if self.follow_symlink:
@@ -166,6 +176,31 @@ class StaticFiles:
             if os.path.commonpath([full_path, directory]) != str(directory):
                 # Don't allow misbehaving clients to break out of the static files directory.
                 continue
+
+            # Try to find a compressed version first based on Accept-Encoding
+            stat_result = None
+            compressed_path = None
+
+            # Check for .br (Brotli) first, then .gz (Gzip) based on client preference
+            if "br" in accepted_encodings:
+                br_path = full_path + ".br"
+                try:
+                    br_stat = os.stat(br_path)
+                    if stat.S_ISREG(br_stat.st_mode):
+                        return br_path, br_stat
+                except (FileNotFoundError, NotADirectoryError):
+                    pass
+
+            if "gzip" in accepted_encodings or "gz" in accepted_encodings:
+                gz_path = full_path + ".gz"
+                try:
+                    gz_stat = os.stat(gz_path)
+                    if stat.S_ISREG(gz_stat.st_mode):
+                        return gz_path, gz_stat
+                except (FileNotFoundError, NotADirectoryError):
+                    pass
+
+            # Fallback to uncompressed file
             try:
                 return full_path, os.stat(full_path)
             except (FileNotFoundError, NotADirectoryError):
@@ -181,7 +216,36 @@ class StaticFiles:
     ) -> Response:
         request_headers = Headers(scope=scope)
 
+        # Determine original file path and compression encoding
+        encoding = None
+        original_path = str(full_path)
+        if full_path.endswith(".br"):
+            encoding = "br"
+            original_path = full_path[:-3]  # Remove .br extension
+        elif full_path.endswith(".gz"):
+            encoding = "gzip"
+            original_path = full_path[:-3]  # Remove .gz extension
+
+        # Create FileResponse with the actual file path (compressed or not)
         response = FileResponse(full_path, status_code=status_code, stat_result=stat_result)
+
+        # Set Content-Encoding if we're serving a compressed file
+        if encoding:
+            response.headers["content-encoding"] = encoding
+
+        # Set Vary header to indicate that the response varies based on Accept-Encoding
+        # This is crucial for proper caching behavior with CDNs and intermediate caches
+        response.headers["vary"] = "Accept-Encoding"
+
+        # Preserve the original file's content-type based on the original path
+        # FileResponse already guesses content-type from the filename, but we want to
+        # ensure it's based on the original (uncompressed) file extension
+        if encoding:
+            import mimetypes
+            content_type, _ = mimetypes.guess_type(original_path)
+            if content_type:
+                response.headers["content-type"] = content_type
+
         if self.is_not_modified(response.headers, request_headers):
             return NotModifiedResponse(response.headers)
         return response
