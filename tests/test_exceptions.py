@@ -22,6 +22,14 @@ def not_acceptable(request: Request) -> None:
     raise HTTPException(status_code=406)
 
 
+def method_not_allowed(request: Request) -> None:
+    raise HTTPException(status_code=405, headers={"Allow": "GET, POST"})
+
+
+def not_found(request: Request) -> None:
+    raise HTTPException(status_code=404, detail="Custom 404 detail")
+
+
 def no_content(request: Request) -> None:
     raise HTTPException(status_code=204)
 
@@ -59,6 +67,8 @@ router = Router(
     routes=[
         Route("/runtime_error", endpoint=raise_runtime_error),
         Route("/not_acceptable", endpoint=not_acceptable),
+        Route("/method_not_allowed", endpoint=method_not_allowed),
+        Route("/not_found", endpoint=not_found),
         Route("/no_content", endpoint=no_content),
         Route("/not_modified", endpoint=not_modified),
         Route("/with_headers", endpoint=with_headers),
@@ -85,6 +95,19 @@ def test_not_acceptable(client: TestClient) -> None:
     response = client.get("/not_acceptable")
     assert response.status_code == 406
     assert response.text == "Not Acceptable"
+
+
+def test_method_not_allowed(client: TestClient) -> None:
+    response = client.get("/method_not_allowed")
+    assert response.status_code == 405
+    assert "Method Not Allowed" in response.text
+    assert response.headers["Allow"] == "GET, POST"
+
+
+def test_not_found(client: TestClient) -> None:
+    response = client.get("/not_found")
+    assert response.status_code == 404
+    assert "Custom 404 detail" in response.text
 
 
 def test_no_content(client: TestClient) -> None:
@@ -222,3 +245,66 @@ def test_handlers_annotations() -> None:
 
     ExceptionMiddleware(router, handlers={Exception: sync_catch_all_handler})
     ExceptionMiddleware(router, handlers={Exception: async_catch_all_handler})
+
+
+def test_debug_mode_plain_text() -> None:
+    """Test that debug mode provides detailed plain text responses for HTTP exceptions."""
+    debug_app = ExceptionMiddleware(router, debug=True)
+    client = TestClient(debug_app, raise_server_exceptions=False)
+
+    response = client.get("/method_not_allowed")
+    assert response.status_code == 405
+    assert "405 Method Not Allowed" in response.text
+    assert "Headers:" in response.text
+    assert "Allow: GET, POST" in response.text
+
+    response = client.get("/not_found")
+    assert response.status_code == 404
+    assert "404 Custom 404 detail" in response.text
+
+
+def test_debug_mode_html() -> None:
+    """Test that debug mode provides detailed HTML responses for HTTP exceptions."""
+    debug_app = ExceptionMiddleware(router, debug=True)
+    client = TestClient(debug_app, raise_server_exceptions=False)
+
+    response = client.get("/method_not_allowed", headers={"Accept": "text/html"})
+    assert response.status_code == 405
+    assert response.headers["content-type"].startswith("text/html")
+    assert "405 Error" in response.text
+    assert "Method Not Allowed" in response.text
+    assert "status_code" in response.text
+    assert "405" in response.text
+    assert "Allow" in response.text
+
+    response = client.get("/not_found", headers={"Accept": "text/html"})
+    assert response.status_code == 404
+    assert response.headers["content-type"].startswith("text/html")
+    assert "404 Error" in response.text
+    assert "Custom 404 detail" in response.text
+
+
+def test_debug_mode_non_html_accept() -> None:
+    """Test that debug mode falls back to plain text when Accept is not HTML."""
+    debug_app = ExceptionMiddleware(router, debug=True)
+    client = TestClient(debug_app, raise_server_exceptions=False)
+
+    response = client.get("/method_not_allowed", headers={"Accept": "application/json"})
+    assert response.status_code == 405
+    assert "405 Method Not Allowed" in response.text
+    assert "Headers:" in response.text
+
+
+def test_debug_mode_204_304_unchanged() -> None:
+    """Test that 204 and 304 responses are unchanged even in debug mode."""
+    debug_app = ExceptionMiddleware(router, debug=True)
+    client = TestClient(debug_app, raise_server_exceptions=False)
+
+    response = client.get("/no_content")
+    assert response.status_code == 204
+    assert response.text == ""
+    assert "content-length" not in response.headers
+
+    response = client.get("/not_modified")
+    assert response.status_code == 304
+    assert response.text == ""
